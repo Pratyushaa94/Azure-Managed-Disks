@@ -44,3 +44,9 @@ terraform init
 terraform plan
 terraform apply
 ```
+
+## What are Azure Managed Disks?
+
+Azure Managed Disks are storage drives provided by Microsoft Azure that you can use with virtual machines. They work like hard drives in the cloud. Azure takes care of managing these disks for you, so you don’t have to worry about storage accounts or hardware.
+
+You can choose different types of disks based on your needs (for example, faster or cheaper). Managed Disks are reliable, secure, and easy to use for storing data in Azure.
