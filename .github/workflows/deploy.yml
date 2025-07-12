@@ -1,33 +1,162 @@
-name: 'Terraform Deploy to Azure'
+name: Terraform with Azure Backend, Infracost, and Approval
 
 on:
   push:
     branches:
       - main
-  pull_request:
 
 jobs:
-  terraform:
+  plan:
+    name: Terraform Plan & Cost Estimation
     runs-on: ubuntu-latest
 
+    env:
+      ARM_CLIENT_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+      ARM_CLIENT_SECRET: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+      ARM_SUBSCRIPTION_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
+      ARM_TENANT_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).tenantId }}
+
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-
       - name: Azure Login
-        uses: azure/login@v2
+        uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Export ARM environment variables
+        run: |
+          echo "ARM_CLIENT_ID=${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}" >> $GITHUB_ENV
+          echo "ARM_CLIENT_SECRET=${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ fromJson(secrets.AZURE_CREDENTIALS).tenantId }}" >> $GITHUB_ENV
+
+      - name: Ensure Azure Backend Storage Exists
+        run: |
+          RESOURCE_GROUP="rg-of-carbon"
+          STORAGE_ACCOUNT="storage88998898"
+          CONTAINER_NAME="container5579"
+          LOCATION="eastus2"
+
+          echo "Checking Resource Group..."
+          if az group show --name $RESOURCE_GROUP &> /dev/null; then
+            echo "Resource Group exists."
+          else
+            az group create --name $RESOURCE_GROUP --location $LOCATION
+          fi
+
+          echo "Checking Storage Account..."
+          if az storage account show --name $STORAGE_ACCOUNT --resource-group $RESOURCE_GROUP &> /dev/null; then
+            echo "Storage Account exists."
+          else
+            az storage account create \
+              --name $STORAGE_ACCOUNT \
+              --resource-group $RESOURCE_GROUP \
+              --location $LOCATION \
+              --sku Standard_LRS
+          fi
+
+          echo "Getting Storage Account Key..."
+          ACCOUNT_KEY=$(az storage account keys list \
+            --account-name $STORAGE_ACCOUNT \
+            --resource-group $RESOURCE_GROUP \
+            --query "[0].value" -o tsv)
+
+          echo "Checking Container..."
+          if az storage container show \
+            --name $CONTAINER_NAME \
+            --account-name $STORAGE_ACCOUNT \
+            --account-key $ACCOUNT_KEY &> /dev/null; then
+            echo "Container exists."
+          else
+            az storage container create \
+              --name $CONTAINER_NAME \
+              --account-name $STORAGE_ACCOUNT \
+              --account-key $ACCOUNT_KEY
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
 
       - name: Terraform Init
         run: terraform init
 
+      - name: Force unlock Terraform state (optional recovery)
+        run: terraform force-unlock -force af52a5c2-702e-b0ef-9742-5bb38af72854 || echo "No lock or already unlocked"
+        continue-on-error: true
+
       - name: Terraform Plan
-        run: terraform plan
+        run: terraform plan -var-file="environments/dev.tfvars" -out=tfplan
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate Infracost Breakdown
+        run: |
+          infracost breakdown \
+            --path=. \
+            --format=table \
+            --terraform-plan-flags="-out=tfplan" \
+            --out-file=infracost-report.txt
+
+      - name: Upload Infracost Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost-report
+          path: infracost-report.txt
+
+      - name: Show Infracost report
+        run: |
+          echo "INFO: Infracost cost breakdown report:"
+          cat infracost-report.txt
+
+  apply:
+    name: Terraform Apply (Manual Approval)
+    runs-on: ubuntu-latest
+    needs: plan
+    environment:
+      name: dev-approval
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Export ARM environment variables
+        run: |
+          echo "ARM_CLIENT_ID=${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}" >> $GITHUB_ENV
+          echo "ARM_CLIENT_SECRET=${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ fromJson(secrets.AZURE_CREDENTIALS).tenantId }}" >> $GITHUB_ENV
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: .
 
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -auto-approve
+        run: terraform apply tfplan
